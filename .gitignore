@@ -25,3 +25,4 @@ __pycache__/
 # Coverage
 .coverage
 htmlcov/
+/backend/migrations/0001_initial.py
