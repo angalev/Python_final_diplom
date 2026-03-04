@@ -1,4 +1,5 @@
-
+from django.conf import settings
+from django.core.mail import send_mail
 from django.core.validators import URLValidator
 from django.http import JsonResponse
 from django.core.exceptions import ValidationError
@@ -52,7 +53,13 @@ class RegisterAccount(APIView):
             type=request.data.get('type', 'buyer'),
             is_active=False
         )
-
+        send_mail(
+            subject='Регистрация завершена',
+            message='Вы успешно зарегистрировались. Подтвердите email, чтобы войти.',
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[user.email],
+            fail_silently=False,
+        )
         return JsonResponse({'Status': True})
 
 
@@ -207,7 +214,17 @@ class ContactView(APIView):
     def post(self, request):
         serializer = ContactSerializer(data=request.data)
         if serializer.is_valid():
-            serializer.save(user=request.user)
+            contact = serializer.save(user=request.user)
+
+            # Отправить email
+            send_mail(
+                subject='Адрес доставки добавлен',
+                message=f'Адрес {contact.city}, {contact.street} успешно добавлен.',
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[request.user.email],
+                fail_silently=False,
+            )
+
             return JsonResponse({'Status': True})
         return JsonResponse({'Status': False, 'Errors': serializer.errors})
 
@@ -264,6 +281,16 @@ class OrderView(APIView):
         basket.contact_id = contact_id
         basket.state = 'new'
         basket.save()
+
+        # Отправить email о подтверждении заказа
+        send_mail(
+            subject='Заказ подтверждён',
+            message=f'Ваш заказ №{basket.id} успешно оформлен. Спасибо за покупку!',
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[request.user.email],
+            fail_silently=False,
+        )
+
         return JsonResponse({'Status': True})
 
 
