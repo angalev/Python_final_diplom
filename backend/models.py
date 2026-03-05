@@ -1,10 +1,10 @@
-   # backend/models.py
+
 from django.contrib.auth.base_user import BaseUserManager
 from django.contrib.auth.models import AbstractUser
 from django.contrib.auth.validators import UnicodeUsernameValidator
 from django.db import models
 from django.utils.translation import gettext_lazy as _
-from django_rest_passwordreset.tokens import get_token_generator
+import secrets
 
 # Статусы заказа
 STATE_CHOICES = (
@@ -173,8 +173,16 @@ class ProductInfo(models.Model):
         on_delete=models.CASCADE
     )
     quantity = models.PositiveIntegerField(verbose_name='Количество')
-    price = models.PositiveIntegerField(verbose_name='Цена')
-    price_rrc = models.PositiveIntegerField(verbose_name='Рекомендуемая розничная цена')
+    price = models.DecimalField(
+        verbose_name='Цена',
+        max_digits=10,
+        decimal_places=2
+    )
+    price_rrc = models.DecimalField(
+        verbose_name='Рекомендуемая розничная цена',
+        max_digits=10,
+        decimal_places=2
+    )
 
     class Meta:
         verbose_name = 'Информация о продукте'
@@ -326,13 +334,19 @@ class OrderItem(models.Model):
 
 # =================== ТОКЕН ПОДТВЕРЖДЕНИЯ EMAIL ===================
 class ConfirmEmailToken(models.Model):
+    """
+    Модель для хранения токенов подтверждения email
+    """
     class Meta:
         verbose_name = 'Токен подтверждения Email'
         verbose_name_plural = 'Токены подтверждения Email'
 
     @staticmethod
     def generate_key():
-        return get_token_generator().generate_token()
+        """
+        Генерирует URL-безопасный токен длиной 32 байта
+        """
+        return secrets.token_urlsafe(32)
 
     user = models.ForeignKey(
         User,
@@ -340,12 +354,23 @@ class ConfirmEmailToken(models.Model):
         on_delete=models.CASCADE,
         verbose_name="Пользователь"
     )
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
-    key = models.CharField(_("Key"), max_length=64, db_index=True, unique=True)
+    key = models.CharField(
+        _("Key"),
+        max_length=64,
+        db_index=True,
+        unique=True
+    )
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+        verbose_name="Дата создания"
+    )
 
     def save(self, *args, **kwargs):
         if not self.key:
             self.key = self.generate_key()
+        # Защита от ручного изменения ключа
+        if 'key' in kwargs.get('update_fields', []):
+            raise ValueError("Нельзя изменять ключ токена вручную.")
         return super().save(*args, **kwargs)
 
     def __str__(self):
