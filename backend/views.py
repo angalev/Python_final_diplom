@@ -6,6 +6,8 @@ from django.contrib.auth import get_user_model, authenticate
 from django.db import transaction
 from requests import get
 from yaml import load as load_yaml, Loader
+from datetime import timedelta
+from django.utils import timezone
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -16,7 +18,7 @@ from rest_framework.generics import get_object_or_404
 
 from .models import (
     User, Shop, Category, Product, ProductInfo,
-    Order, OrderItem, Parameter, ProductParameter
+    Order, OrderItem, Parameter, ProductParameter, ConfirmEmailToken
 )
 from .serializers import (
     UserSerializer, ContactSerializer, ShopSerializer,
@@ -29,8 +31,8 @@ User = get_user_model()
 # =================== РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ ===================
 class RegisterAccount(APIView):
     """
-    Регистрация пользователя (создаёт неактивного юзера)
-    POST /api/user/register
+    Регистрация пользователя → создаёт неактивного юзера + токен
+    POST /api/user/register/
     """
     permission_classes = [AllowAny]
 
@@ -53,42 +55,63 @@ class RegisterAccount(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        if User.objects.filter(email=email).exists():
+        user = User.objects.filter(email=email).first()
+
+        # Проверяем, существует ли неактивный пользователь
+        if user and not user.is_active:
+            # Проверяем, прошла ли минута с последней попытки
+            last_token = ConfirmEmailToken.objects.filter(user=user).order_by('-created_at').first()
+            if last_token and timezone.now() < last_token.created_at + timedelta(minutes=1):
+                return Response(
+                    {'Status': False, 'Errors': 'Повторная отправка возможна не чаще 1 раза в минуту'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            # Удаляем старый токен — будем создавать новый
+            ConfirmEmailToken.objects.filter(user=user).delete()
+
+        elif user and user.is_active:
             return Response(
-                {'Status': False, 'Errors': 'Пользователь с таким email уже существует'},
+                {'Status': False, 'Errors': 'Пользователь с таким email уже активирован'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Создаём неактивного пользователя
-        user = User.objects.create_user(
-            email=email,
-            password=request.data['password'],
-            first_name=request.data['first_name'].strip(),
-            last_name=request.data['last_name'].strip(),
-            company=request.data['company'].strip(),
-            position=request.data['position'].strip(),
-            is_active=False,
-            type=request.data.get('type', 'buyer')
-        )
+        # Создаём неактивного пользователя (если ещё нет)
+        if not user:
+            user = User.objects.create_user(
+                email=email,
+                password=request.data['password'],
+                first_name=request.data['first_name'].strip(),
+                last_name=request.data['last_name'].strip(),
+                company=request.data['company'].strip(),
+                position=request.data['position'].strip(),
+                is_active=False,
+                type=request.data.get('type', 'buyer')
+            )
 
-        # Инструкция для активации (не ссылка!)
-        message = (
-            'Вы зарегистрировались на нашем сайте.\n\n'
-            'Чтобы активировать аккаунт, нажмите кнопку "Подтвердить" в приложении.\n\n'
-            'Или отправьте POST-запрос:\n'
-            'POST /api/user/register/confirm/\n'
-            'Content-Type: application/json\n\n'
-            f'{{"email": "{email}"}}'
-        )
+        # Создаём токен подтверждения
+        token, created = ConfirmEmailToken.objects.get_or_create(user_id=user.id)
+        confirm_url = f"http://localhost:8000/api/user/confirm/?token={token.key}"
 
         # Отправляем письмо
-        send_mail(
-            subject='Подтвердите ваш email',
-            message=message,
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            recipient_list=[user.email],
-            fail_silently=False,
-        )
+        try:
+            send_mail(
+                subject='Подтвердите ваш email',
+                message=f'Чтобы активировать аккаунт, перейдите по ссылке:\n\n{confirm_url}',
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[user.email],
+                fail_silently=False,
+            )
+        except Exception as e:
+            # 🔥 Если письмо не отправилось — удаляем токен
+            token.delete()
+            return Response(
+                {
+                    'Status': False,
+                    'Errors': 'Не удалось отправить письмо. Попробуйте позже.',
+                    'Detail': str(e) if settings.DEBUG else None
+                },
+                status=status.HTTP_502_BAD_GATEWAY
+            )
 
         return Response({
             'Status': True,
@@ -99,34 +122,40 @@ class RegisterAccount(APIView):
 # =================== ПОДТВЕРЖДЕНИЕ EMAIL ===================
 class ConfirmAccount(APIView):
     """
-    Активация пользователя через POST
-    POST /api/user/register/confirm/
+    Активация аккаунта по токену
+    GET /api/user/confirm/?token=abc123
     """
-    permission_classes = [AllowAny]  # ← исправлено: вне метода
+    permission_classes = [AllowAny]
 
-    def post(self, request):
-        email = request.data.get('email')
-        if not email:
+    def get(self, request):
+        token_key = request.query_params.get('token')
+
+        if not token_key:
             return Response(
-                {'Status': False, 'Errors': 'Email обязателен'},
+                {'Status': False, 'Errors': 'Токен обязателен в ссылке'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        try:
-            user = User.objects.get(email=email)
-        except User.DoesNotExist:
-            return Response(
-                {'Status': False, 'Errors': 'Пользователь не найден'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        # Ищем токен
+        token = get_object_or_404(ConfirmEmailToken, key=token_key)
 
+        # Получаем пользователя
+        user = token.user
+
+        # Если уже активирован — удаляем токен и сообщаем
         if user.is_active:
+            token.delete()
             return Response({'Status': True, 'Message': 'Аккаунт уже активирован'})
 
+        # Активируем
         user.is_active = True
         user.save()
 
+        # Создаём DRF-токен для авторизации
         Token.objects.get_or_create(user=user)
+
+        # Удаляем токен подтверждения (одноразовый!)
+        token.delete()
 
         return Response({'Status': True, 'Message': 'Аккаунт успешно активирован!'})
 
@@ -264,21 +293,55 @@ class BasketView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        added_count = 0
+        errors = []
+
         with transaction.atomic():
+
             basket, _ = Order.objects.get_or_create(user=request.user, state='basket')
+
             for item in items:
                 product_info_id = item.get('product_info')
-                quantity = item.get('quantity')
-                if not product_info_id or not quantity:
+                quantity = item.get('quantity', 1)
+
+                if not product_info_id:
+                    errors.append(f"Отсутствует product_info_id в элементе: {item}")
                     continue
+
+                if not isinstance(quantity, int) or quantity < 1:
+                    errors.append(f"Некорректное количество '{quantity}' для product_info_id={product_info_id}")
+                    continue
+
+                try:
+                    product_info = ProductInfo.objects.get(id=product_info_id)
+                except ProductInfo.DoesNotExist:
+                    errors.append(f"Товар с product_info_id={product_info_id} не найден")
+                    continue
+
                 order_item, created = OrderItem.objects.get_or_create(
                     order=basket,
-                    product_info_id=product_info_id,
+                    product_info=product_info,
                     defaults={'quantity': quantity}
                 )
                 if not created:
                     order_item.quantity += quantity
                     order_item.save()
+
+                added_count += 1
+
+        if added_count == 0:
+            return Response({
+                'Status': False,
+                'Errors': 'Не удалось добавить ни один товар',
+                'Details': errors
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if errors:
+            return Response({
+                'Status': True,
+                'Message': f'Добавлено товаров: {added_count}',
+                'Warnings': errors
+            })
 
         return Response({'Status': True})
 
@@ -290,19 +353,36 @@ class BasketView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        basket = Order.objects.filter(user=request.user, state='basket').first()
-        if not basket:
-            return Response(
-                {'Status': False, 'Errors': 'Корзина не найдена'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        updated_count = 0
+        errors = []
 
         with transaction.atomic():
+
+            basket, _ = Order.objects.get_or_create(user=request.user, state='basket')
+
             for item in items:
-                order_item = basket.ordered_items.filter(product_info_id=item.get('product_info')).first()
-                if order_item:
-                    order_item.quantity = item.get('quantity', 1)
-                    order_item.save()
+                product_info_id = item.get('product_info')
+                quantity = item.get('quantity')
+
+                if not product_info_id or not isinstance(quantity, int) or quantity < 1:
+                    errors.append(f"Некорректные данные: {item}")
+                    continue
+
+                order_item = basket.ordered_items.filter(product_info_id=product_info_id).first()
+                if not order_item:
+                    errors.append(f"Товар с product_info_id={product_info_id} не найден в корзине")
+                    continue
+
+                order_item.quantity = quantity
+                order_item.save()
+                updated_count += 1
+
+        if errors:
+            return Response({
+                'Status': True,
+                'Message': f'Обновлено: {updated_count}',
+                'Warnings': errors
+            })
 
         return Response({'Status': True})
 
@@ -317,15 +397,28 @@ class BasketView(APIView):
         basket = Order.objects.filter(user=request.user, state='basket').first()
         if not basket:
             return Response(
-                {'Status': False, 'Errors': 'Корзина не найдена'},
+                {'Status': False, 'Errors': 'Корзина пуста или не существует'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        deleted_count = 0
+        errors = []
+
         with transaction.atomic():
             for item in items:
-                basket.ordered_items.filter(product_info_id=item.get('product_info')).delete()
+                product_info_id = item.get('product_info')
+                if not product_info_id:
+                    errors.append("Отсутствует product_info_id")
+                    continue
 
-        return Response({'Status': True})
+                deleted, _ = basket.ordered_items.filter(product_info_id=product_info_id).delete()
+                deleted_count += deleted
+
+        return Response({
+            'Status': True,
+            'Message': f'Удалено позиций: {deleted_count}',
+            'Warnings': errors if errors else None
+        })
 
 
 # =================== ЗАКАЗЫ ===================
@@ -485,22 +578,26 @@ class PartnerState(APIView):
                 {'Status': False, 'Errors': 'Только для магазинов'},
                 status=status.HTTP_403_FORBIDDEN
             )
+
         state = request.data.get('state')
-        if state not in ('true', 'false'):
+
+        if not isinstance(state, bool):
             return Response(
-                {'Status': False, 'Errors': 'Неверное значение'},
+                {'Status': False, 'Errors': 'Поле "state" должно быть булевым значением (true/false)'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        shop = getattr(request.user, 'shop', None)
-        if shop:
-            shop.state = state == 'true'
-            shop.save()
-            return Response({'Status': True})
-        return Response(
-            {'Status': False, 'Errors': 'Магазин не найден'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
 
+        shop = getattr(request.user, 'shop', None)
+        if not shop:
+            return Response(
+                {'Status': False, 'Errors': 'Магазин не найден'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        shop.state = state
+        shop.save()
+
+        return Response({'Status': True})
 
 class PartnerOrders(APIView):
     """
